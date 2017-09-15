@@ -116,13 +116,13 @@ func (c *Client) GoodPost(url string, contentType string, body io.Reader) (resp 
 	urlsList := c.LookupForRequest(url)
 	// fmt.Println(urlsList)
 	i := rand.Intn(len(urlsList))
-	resp, err = c.Post(url, contentType, body)
+	resp, err = c.Post(urlsList[i], contentType, body)
 	if err != nil {
 		j := rand.Intn(len(urlsList) - 1)
 		if j >= i {
 			j++
 		}
-		resp, err = c.Post(url, contentType, body)
+		resp, err = c.Post(urlsList[i], contentType, body)
 	}
 	return
 }
