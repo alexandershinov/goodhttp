@@ -5,13 +5,13 @@ import (
 	"github.com/bogdanovich/dns_resolver"
 	"net"
 	"time"
-	"crypto/tls"
 	"io"
 	url2 "net/url"
 	"math/rand"
 	// "fmt"
 	"strings"
 	"fmt"
+	"context"
 )
 
 var mainResolver, fallbackResolver *dns_resolver.DnsResolver
@@ -55,8 +55,6 @@ func (c *Client) UpdateTransport() {
 			Timeout: c.DialTimeout,
 		}).Dial,
 		TLSHandshakeTimeout: c.TLSHandshakeTimeout,
-		// Todo: Если убрать отсутствие проверки сертификата, при обращении на конкретный ip будет ошибка x509: cannot validate certificate
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
 		IdleConnTimeout: c.IdleConnTimeout,
 	}
 	c.Transport = &transport
@@ -105,7 +103,7 @@ func (c *Client) LookupForRequest(url string) (urlList []string) {
 	}
 	for i := 0; i < len(ipList); i++ {
 		parsedUrl.Host = ipList[i].String()
-		urlList = append(urlList, parsedUrl.String())
+		urlList = append(urlList, parsedUrl.Host)
 	}
 	return
 }
@@ -115,14 +113,29 @@ func (c *Client) LookupForRequest(url string) (urlList []string) {
 func (c *Client) GoodPost(url string, contentType string, body io.Reader) (resp *http.Response, err error) {
 	urlsList := c.LookupForRequest(url)
 	// fmt.Println(urlsList)
+	dialer := &net.Dialer{
+		Timeout:   c.DialTimeout,
+	}
 	i := rand.Intn(len(urlsList))
-	resp, err = c.Post(urlsList[i], contentType, body)
+	c.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if strings.Contains(url, strings.Replace(addr, ":443", "", 1)) {
+			addr = urlsList[i] + ":443"
+		}
+		return dialer.DialContext(ctx, network, addr)
+	}
+	resp, err = c.Post(url, contentType, body)
 	if err != nil {
 		j := rand.Intn(len(urlsList) - 1)
 		if j >= i {
 			j++
 		}
-		resp, err = c.Post(urlsList[i], contentType, body)
+		c.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if strings.Contains(url, strings.Replace(addr, ":443", "", 1)) {
+				addr = urlsList[j] + ":443"
+			}
+			return dialer.DialContext(ctx, network, addr)
+		}
+		resp, err = c.Post(url, contentType, body)
 	}
 	return
 }
