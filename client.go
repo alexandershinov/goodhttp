@@ -2,32 +2,37 @@ package goodhttp
 
 import (
 	"net/http"
-	"github.com/bogdanovich/dns_resolver"
 	"net"
 	"time"
 	"io"
 	url2 "net/url"
 	"math/rand"
-	// "fmt"
 	"strings"
 	"fmt"
 	"context"
 )
 
-var mainResolver, fallbackResolver *dns_resolver.DnsResolver
+var (
+	mainResolver, fallbackResolver *GoodResolver
+)
 
-const defaultConnectionTimeout time.Duration = time.Second * 5
+const (
+	DefaultConnectionTimeout   time.Duration = time.Second * 5
+	DefaultTLSHandshakeTimeout time.Duration = 1 * time.Second
+	DefaultIdleConnTimeout     time.Duration = 1 * time.Second
+	DefaultDialTimeout         time.Duration = 1 * time.Second
+)
 
 func init() {
 	rand.Seed(time.Now().Unix())
-	mainResolver, _ = dns_resolver.NewFromResolvConf("/etc/resolv.conf")
-	fallbackResolver = dns_resolver.New([]string{"8.8.8.8"})
+	mainResolver = NewResolverFromResolvConf("/etc/resolv.conf")
+	fallbackResolver = NewResolver([]string{"8.8.8.8"})
 }
 
 type Client struct {
 	http.Client
-	MainResolver        *dns_resolver.DnsResolver
-	FallbackResolver    *dns_resolver.DnsResolver
+	MainResolver        *GoodResolver
+	FallbackResolver    *GoodResolver
 	TLSHandshakeTimeout time.Duration
 	IdleConnTimeout     time.Duration
 	DialTimeout         time.Duration
@@ -36,10 +41,16 @@ type Client struct {
 // Создание нового http клиента с параметрами по умолчанию
 func NewClient() *Client {
 	var c Client
-	c.IdleConnTimeout = 1 * time.Second
-	c.DialTimeout = 1 * time.Second
-	c.TLSHandshakeTimeout = 1 * time.Second
-	c.Timeout = defaultConnectionTimeout
+	c.IdleConnTimeout = DefaultIdleConnTimeout
+	c.DialTimeout = DefaultDialTimeout
+	c.Transport = &http.Transport{
+		// Todo: Уточнить параметры keepalive
+		DialContext: (&net.Dialer{
+			Timeout: DefaultDialTimeout,
+		}).DialContext,
+	}
+	c.TLSHandshakeTimeout = DefaultTLSHandshakeTimeout
+	c.Timeout = DefaultConnectionTimeout
 	c.MainResolver = mainResolver
 	c.FallbackResolver = fallbackResolver
 	c.UpdateTransport()
@@ -49,15 +60,11 @@ func NewClient() *Client {
 // Обновление Transport для клиента. Обновляется для изменения таймаутов.
 // Перед вызовом устанавливаются значения таймаутов в самом Client, а эта функция применяет их к Transport.
 func (c *Client) UpdateTransport() {
-	transport := http.Transport{
-		// Todo: Уточнить параметры keepalive
-		Dial: (&net.Dialer{
-			Timeout: c.DialTimeout,
-		}).Dial,
-		TLSHandshakeTimeout: c.TLSHandshakeTimeout,
-		IdleConnTimeout: c.IdleConnTimeout,
-	}
-	c.Transport = &transport
+	c.Transport.(*http.Transport).TLSHandshakeTimeout = c.TLSHandshakeTimeout
+	c.Transport.(*http.Transport).IdleConnTimeout = c.IdleConnTimeout
+	c.Transport.(*http.Transport).DialContext = (&net.Dialer{
+		Timeout: c.DialTimeout,
+	}).DialContext
 }
 
 // Функции для установки значений параметров таймаутов
@@ -78,8 +85,7 @@ func (c *Client) SetTransportTLSHandshakeTimeout(t time.Duration) {
 }
 
 // Определение списка адресов, в которые ресолвится хост переданного параметра url
-func (c *Client) LookupForRequest(url string) (urlList []string) {
-	var ipList []net.IP
+func (c *Client) LookupForRequest(url string) (ipList []net.IP) {
 	var err error
 	if ! strings.Contains(url, "://") {
 		url = fmt.Sprintf("https://%s", url)
@@ -90,20 +96,16 @@ func (c *Client) LookupForRequest(url string) (urlList []string) {
 	}
 	resolver := c.MainResolver
 	if resolver != nil && len(resolver.Servers) > 0 {
-		ipList, err = resolver.LookupHost(parsedUrl.Host)
+		ipList, err = resolver.Lookup(parsedUrl.Host)
 	}
 	if len(ipList) == 0 {
 		resolver = c.FallbackResolver
 		if resolver == nil || len(resolver.Servers) == 0 {
 			panic("Empty fallback resolver.")
 		}
-		if ipList, err = resolver.LookupHost(parsedUrl.Host); err != nil {
+		if ipList, err = resolver.Lookup(parsedUrl.Host); err != nil {
 			panic(err)
 		}
-	}
-	for i := 0; i < len(ipList); i++ {
-		parsedUrl.Host = ipList[i].String()
-		urlList = append(urlList, parsedUrl.Host)
 	}
 	return
 }
@@ -111,27 +113,26 @@ func (c *Client) LookupForRequest(url string) (urlList []string) {
 // Запрос типа POST к случайному ip из известных
 // При ошибке одна дополнительная попытка по другому ip
 func (c *Client) GoodPost(url string, contentType string, body io.Reader) (resp *http.Response, err error) {
-	urlsList := c.LookupForRequest(url)
-	// fmt.Println(urlsList)
+	ipList := c.LookupForRequest(url)
 	dialer := &net.Dialer{
-		Timeout:   c.DialTimeout,
+		Timeout: c.DialTimeout,
 	}
-	i := rand.Intn(len(urlsList))
+	i := rand.Intn(len(ipList))
 	c.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if strings.Contains(url, strings.Replace(addr, ":443", "", 1)) {
-			addr = urlsList[i] + ":443"
+			addr = ipList[i].String() + ":443"
 		}
 		return dialer.DialContext(ctx, network, addr)
 	}
 	resp, err = c.Post(url, contentType, body)
 	if err != nil {
-		j := rand.Intn(len(urlsList) - 1)
+		j := rand.Intn(len(ipList) - 1)
 		if j >= i {
 			j++
 		}
 		c.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if strings.Contains(url, strings.Replace(addr, ":443", "", 1)) {
-				addr = urlsList[j] + ":443"
+				addr = ipList[j].String() + ":443"
 			}
 			return dialer.DialContext(ctx, network, addr)
 		}
