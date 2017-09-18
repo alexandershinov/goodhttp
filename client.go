@@ -10,6 +10,7 @@ import (
 	"strings"
 	"fmt"
 	"context"
+	//"github.com/felixge/tcpkeepalive"
 )
 
 var (
@@ -17,11 +18,20 @@ var (
 )
 
 const (
-	DefaultConnectionTimeout   time.Duration = time.Second * 5
+	DefaultConnectionTimeout   time.Duration = time.Second * 60
 	DefaultTLSHandshakeTimeout time.Duration = 1 * time.Second
 	DefaultIdleConnTimeout     time.Duration = 1 * time.Second
 	DefaultDialTimeout         time.Duration = 1 * time.Second
+	DefaultKeepaliveTimeout    time.Duration = 60 * time.Second
 )
+
+type Error struct {
+	Text string
+}
+
+func (e *Error) Error() string {
+	return e.Text
+}
 
 func init() {
 	rand.Seed(time.Now().Unix())
@@ -63,6 +73,7 @@ func (c *Client) UpdateTransport() {
 	c.Transport.(*http.Transport).TLSHandshakeTimeout = c.TLSHandshakeTimeout
 	c.Transport.(*http.Transport).IdleConnTimeout = c.IdleConnTimeout
 	c.Transport.(*http.Transport).DialContext = (&net.Dialer{
+		KeepAlive: DefaultKeepaliveTimeout,
 		Timeout: c.DialTimeout,
 	}).DialContext
 }
@@ -117,15 +128,24 @@ func (c *Client) GoodPost(url string, contentType string, body io.Reader) (resp 
 	dialer := &net.Dialer{
 		Timeout: c.DialTimeout,
 	}
+	if len(ipList) == 0 {
+		return nil, &Error{"Can`t lookup hostname."}
+	}
 	i := rand.Intn(len(ipList))
 	c.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if strings.Contains(url, strings.Replace(addr, ":443", "", 1)) {
 			addr = ipList[i].String() + ":443"
 		}
-		return dialer.DialContext(ctx, network, addr)
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return conn, err
+		}
+		//tcpkeepalive.EnableKeepAlive(conn)
+		//tcpkeepalive.SetKeepAlive(conn, 1*time.Second, 3, 1*time.Second)
+		return conn, err
 	}
 	resp, err = c.Post(url, contentType, body)
-	if err != nil {
+	if err != nil && len(ipList) > 1 {
 		j := rand.Intn(len(ipList) - 1)
 		if j >= i {
 			j++
@@ -134,7 +154,13 @@ func (c *Client) GoodPost(url string, contentType string, body io.Reader) (resp 
 			if strings.Contains(url, strings.Replace(addr, ":443", "", 1)) {
 				addr = ipList[j].String() + ":443"
 			}
-			return dialer.DialContext(ctx, network, addr)
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return conn, err
+			}
+			//tcpkeepalive.EnableKeepAlive(conn)
+			//tcpkeepalive.SetKeepAlive(conn, 1*time.Second, 3, 1*time.Second)
+			return conn, err
 		}
 		resp, err = c.Post(url, contentType, body)
 	}

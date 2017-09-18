@@ -3,15 +3,28 @@ package goodhttp_test
 import (
 	"testing"
 	. "github.com/alexandershinov/goodhttp"
+	"github.com/kabukky/httpscerts"
 	"net"
 	url2 "net/url"
 	"fmt"
+	"io"
+	"bytes"
+	"net/http"
 )
 
 type lookupForRequestTest struct {
 	MainDns     map[string][]net.IP
 	FallbackDns map[string][]net.IP
 	host        string
+}
+
+type goodPostTest struct {
+	MainDns     map[string][]net.IP
+	FallbackDns map[string][]net.IP
+	Url         url2.URL
+	ContentType string
+	Body        io.Reader
+	Result      error
 }
 
 func TestNewClient(t *testing.T) {
@@ -30,37 +43,28 @@ func TestNewClient(t *testing.T) {
 	}
 }
 
+func newLocalDns(DnsMap map[string][]net.IP) (localResolver *GoodResolver) {
+	localResolver = new(GoodResolver)
+	localResolver.Lookup = func(host string) ([]net.IP, error) {
+		url, err := url2.Parse(host)
+		if err != nil {
+			return make([]net.IP, 0), err
+		}
+		host = url.Host
+		if "" == host {
+			host = url.Path
+		}
+		ipList := DnsMap[host]
+		return ipList, nil
+	}
+	localResolver.Servers = []string{"0.0.0.0"}
+	return
+}
+
 func (test *lookupForRequestTest) Do(t *testing.T) {
-	var testMainResolver, testFallbackResolver GoodResolver
-	testMainResolver.Lookup = func(host string) ([]net.IP, error) {
-		url, err := url2.Parse(host)
-		if err != nil {
-			return make([]net.IP, 0), err
-		}
-		host = url.Host
-		if "" == host {
-			host = url.Path
-		}
-		ipList := test.MainDns[host]
-		return ipList, nil
-	}
-	testFallbackResolver.Lookup = func(host string) ([]net.IP, error) {
-		url, err := url2.Parse(host)
-		if err != nil {
-			return make([]net.IP, 0), err
-		}
-		host = url.Host
-		if "" == host {
-			host = url.Path
-		}
-		ipList := test.FallbackDns[host]
-		return ipList, nil
-	}
 	c := NewClient()
-	c.MainResolver = &testMainResolver
-	c.MainResolver.Servers = []string{"0.0.0.0"}
-	c.FallbackResolver = &testFallbackResolver
-	c.FallbackResolver.Servers = []string{"0.0.0.0"}
+	c.MainResolver = newLocalDns(test.MainDns)
+	c.FallbackResolver = newLocalDns(test.FallbackDns)
 	host := test.host
 	url, err := url2.Parse(host)
 	if err != nil {
@@ -101,6 +105,78 @@ func TestClient_LookupForRequest(t *testing.T) {
 				"example.com": {net.IPv4(1, 1, 1, 3), net.IPv4(2, 2, 2, 3)},
 			},
 			host: "https://example.com",
+		},
+		"test2": {
+			MainDns: map[string][]net.IP{
+				"example.com": {},
+			},
+			FallbackDns: map[string][]net.IP{
+				"example.com": {net.IPv4(1, 1, 1, 3), net.IPv4(2, 2, 2, 3)},
+			},
+			host: "https://example.com",
+		},
+	} {
+		t.Run(name, test.Do)
+	}
+}
+
+func testHandler(w http.ResponseWriter, _ *http.Request) {
+	fmt.Fprintf(w, "OK")
+}
+
+func (test *goodPostTest) Do(t *testing.T) {
+	// test server code
+	if err := httpscerts.Check("cert.pem", "key.pem"); err != nil {
+		if err = httpscerts.Generate("cert.pem", "key.pem", "example.com"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	go func() {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/", testHandler)
+		err := http.ListenAndServeTLS(":443", "cert.pem", "key.pem", mux)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+	//
+	c := NewClient()
+	c.MainResolver = newLocalDns(test.MainDns)
+	c.FallbackResolver = newLocalDns(test.FallbackDns)
+	response, err := c.GoodPost(test.Url.String(), test.ContentType, test.Body)
+	if err == nil && test.Result != nil {
+		t.Error("Must be error.")
+	} else if err != nil {
+		if err.Error() != test.Result.Error() {
+			t.Error(err)
+		}
+	} else {
+		t.Logf("Status code: %d\n", response.StatusCode)
+	}
+}
+
+func TestClient_GoodPost(t *testing.T) {
+	exampleUrl, _ := url2.Parse("https://example.com/")
+	exampleUrl2, _ := url2.Parse("https://example2.com/")
+	testMainDns := map[string][]net.IP{
+		"example.com": {net.IPv4(127, 0, 0, 1)},
+	}
+	for name, test := range map[string]goodPostTest{
+		"testPost1": {
+			testMainDns,
+			testMainDns,
+			*exampleUrl,
+			"application/json",
+			bytes.NewBuffer([]byte(`{"example": "OK"}`)),
+			nil,
+		},
+		"testPost2": {
+			testMainDns,
+			testMainDns,
+			*exampleUrl2,
+			"application/json",
+			bytes.NewBuffer([]byte(`{"example": "OK"}`)),
+			&Error{"Can`t lookup hostname."},
 		},
 	} {
 		t.Run(name, test.Do)
