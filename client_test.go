@@ -2,6 +2,7 @@ package goodhttp_test
 
 import (
 	"testing"
+	"github.com/stretchr/testify/assert"
 	. "github.com/alexandershinov/goodhttp"
 	"github.com/kabukky/httpscerts"
 	"net"
@@ -81,9 +82,7 @@ func (test *lookupForRequestTest) Do(t *testing.T) {
 	} else if _, ok := test.FallbackDns[host]; ok {
 		goodAnswer = test.FallbackDns[host]
 	}
-	if fmt.Sprintf("%v", goodAnswer) != fmt.Sprintf("%v", testAnswer) {
-		t.Errorf("IP list error >> %v must be %v", testAnswer, goodAnswer)
-	}
+	assert.Equalf(t, goodAnswer, testAnswer, "IP list error >> %v must be %v\n", testAnswer, goodAnswer)
 }
 
 func TestClient_LookupForRequest(t *testing.T) {
@@ -125,34 +124,29 @@ func testHandler(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (test *goodPostTest) Do(t *testing.T) {
-	// test server code
+	// Создаём для тестового https сайта example.com сертификат, если его ещё нет
+	// (надо добавить в систему сертификат в доверенные, чтобы не ругался на недоверенный источник)
 	if err := httpscerts.Check("cert.pem", "key.pem"); err != nil {
 		if err = httpscerts.Generate("cert.pem", "key.pem", "example.com"); err != nil {
 			t.Fatal(err)
 		}
 	}
+	// Запускаем в горутине тестовый сервер с созданным сертификатом
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/", testHandler)
-		err := http.ListenAndServeTLS(":443", "cert.pem", "key.pem", mux)
+		err := http.ListenAndServeTLS(":3443", "cert.pem", "key.pem", mux)
 		if err != nil {
 			t.Fatal(err)
 		}
 	}()
-	//
+	// Создаём новый клиент, берём из фикстуры главный и запасной ресолверы
 	c := NewClient()
 	c.MainResolver = newLocalDns(test.MainDns)
 	c.FallbackResolver = newLocalDns(test.FallbackDns)
-	response, err := c.GoodPost(test.Url.String(), test.ContentType, test.Body)
-	if err == nil && test.Result != nil {
-		t.Error("Must be error.")
-	} else if err != nil {
-		if err.Error() != test.Result.Error() {
-			t.Error(err)
-		}
-	} else {
-		t.Logf("Status code: %d\n", response.StatusCode)
-	}
+	// Отправляем POST запрос на тестовый сайт
+	_, err := c.GoodPost(test.Url.String(), test.ContentType, test.Body)
+	assert.Equal(t, test.Result, err, "Vars err and test.Result (error) should be the same.")
 }
 
 func TestClient_GoodPost(t *testing.T) {

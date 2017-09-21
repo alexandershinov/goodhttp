@@ -10,7 +10,7 @@ import (
 	"strings"
 	"fmt"
 	"context"
-	//"github.com/felixge/tcpkeepalive"
+	"github.com/felixge/tcpkeepalive"
 )
 
 var (
@@ -21,8 +21,10 @@ const (
 	DefaultConnectionTimeout   time.Duration = time.Second * 60
 	DefaultTLSHandshakeTimeout time.Duration = 1 * time.Second
 	DefaultIdleConnTimeout     time.Duration = 1 * time.Second
+	DefaultIntervalTimeout     time.Duration = 1 * time.Second
+	DefaultFailAfter           int           = 3
 	DefaultDialTimeout         time.Duration = 1 * time.Second
-	DefaultKeepaliveTimeout    time.Duration = 60 * time.Second
+	DefaultResolveTimeout      time.Duration = 1 * time.Second
 )
 
 type Error struct {
@@ -35,8 +37,8 @@ func (e *Error) Error() string {
 
 func init() {
 	rand.Seed(time.Now().Unix())
-	mainResolver = NewResolverFromResolvConf("/etc/resolv.conf")
-	fallbackResolver = NewResolver([]string{"8.8.8.8"})
+	mainResolver = NewDefaultResolver(DefaultResolveTimeout)
+	fallbackResolver = NewResolver([]string{"8.8.8.8"}, DefaultResolveTimeout)
 }
 
 type Client struct {
@@ -54,7 +56,6 @@ func NewClient() *Client {
 	c.IdleConnTimeout = DefaultIdleConnTimeout
 	c.DialTimeout = DefaultDialTimeout
 	c.Transport = &http.Transport{
-		// Todo: Уточнить параметры keepalive
 		DialContext: (&net.Dialer{
 			Timeout: DefaultDialTimeout,
 		}).DialContext,
@@ -73,8 +74,8 @@ func (c *Client) UpdateTransport() {
 	c.Transport.(*http.Transport).TLSHandshakeTimeout = c.TLSHandshakeTimeout
 	c.Transport.(*http.Transport).IdleConnTimeout = c.IdleConnTimeout
 	c.Transport.(*http.Transport).DialContext = (&net.Dialer{
-		KeepAlive: DefaultKeepaliveTimeout,
-		Timeout: c.DialTimeout,
+		KeepAlive: DefaultConnectionTimeout,
+		Timeout:   c.DialTimeout,
 	}).DialContext
 }
 
@@ -98,6 +99,7 @@ func (c *Client) SetTransportTLSHandshakeTimeout(t time.Duration) {
 // Определение списка адресов, в которые ресолвится хост переданного параметра url
 func (c *Client) LookupForRequest(url string) (ipList []net.IP) {
 	var err error
+	// Если в url строке не указан протокол, используем https
 	if ! strings.Contains(url, "://") {
 		url = fmt.Sprintf("https://%s", url)
 	}
@@ -105,63 +107,57 @@ func (c *Client) LookupForRequest(url string) (ipList []net.IP) {
 	if err != nil {
 		panic(err)
 	}
-	resolver := c.MainResolver
-	if resolver != nil && len(resolver.Servers) > 0 {
+	for _, resolver := range []*GoodResolver{c.MainResolver, c.FallbackResolver} {
+		if len(ipList) > 0 {
+			break
+		}
 		ipList, err = resolver.Lookup(parsedUrl.Host)
 	}
-	if len(ipList) == 0 {
-		resolver = c.FallbackResolver
-		if resolver == nil || len(resolver.Servers) == 0 {
-			panic("Empty fallback resolver.")
-		}
-		if ipList, err = resolver.Lookup(parsedUrl.Host); err != nil {
-			panic(err)
-		}
+	if err != nil {
+		panic(err)
 	}
 	return
+}
+
+// Установка DialContext для транспорта, который будет ресолвить указанный в параметрах метода url в указанный ip
+func (c *Client) SetOneIpDealContext(ipAddr string, url string) {
+	dialer := &net.Dialer{
+		Timeout: c.DialTimeout,
+	}
+	c.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		url, err := url2.Parse(addr)
+		if err != nil {
+			return nil, err
+		}
+		port := url.Port()
+		addr = fmt.Sprintf("%s:%s", ipAddr, port)
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return conn, err
+		}
+		// Включение для соединения tcp keepalive (idle=1s, interval=1s, fail_after=3)
+		tcpkeepalive.EnableKeepAlive(conn)
+		tcpkeepalive.SetKeepAlive(conn, DefaultIdleConnTimeout, DefaultFailAfter, DefaultIntervalTimeout)
+		return conn, err
+	}
 }
 
 // Запрос типа POST к случайному ip из известных
 // При ошибке одна дополнительная попытка по другому ip
 func (c *Client) GoodPost(url string, contentType string, body io.Reader) (resp *http.Response, err error) {
 	ipList := c.LookupForRequest(url)
-	dialer := &net.Dialer{
-		Timeout: c.DialTimeout,
-	}
 	if len(ipList) == 0 {
 		return nil, &Error{"Can`t lookup hostname."}
 	}
 	i := rand.Intn(len(ipList))
-	c.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if strings.Contains(url, strings.Replace(addr, ":443", "", 1)) {
-			addr = ipList[i].String() + ":443"
-		}
-		conn, err := dialer.DialContext(ctx, network, addr)
-		if err != nil {
-			return conn, err
-		}
-		//tcpkeepalive.EnableKeepAlive(conn)
-		//tcpkeepalive.SetKeepAlive(conn, 1*time.Second, 3, 1*time.Second)
-		return conn, err
-	}
+	c.SetOneIpDealContext(ipList[i].String(), url)
 	resp, err = c.Post(url, contentType, body)
 	if err != nil && len(ipList) > 1 {
 		j := rand.Intn(len(ipList) - 1)
 		if j >= i {
 			j++
 		}
-		c.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if strings.Contains(url, strings.Replace(addr, ":443", "", 1)) {
-				addr = ipList[j].String() + ":443"
-			}
-			conn, err := dialer.DialContext(ctx, network, addr)
-			if err != nil {
-				return conn, err
-			}
-			//tcpkeepalive.EnableKeepAlive(conn)
-			//tcpkeepalive.SetKeepAlive(conn, 1*time.Second, 3, 1*time.Second)
-			return conn, err
-		}
+		c.SetOneIpDealContext(ipList[j].String(), url)
 		resp, err = c.Post(url, contentType, body)
 	}
 	return
